@@ -20,6 +20,9 @@ import uuid
 # import goslate
 import argostranslate.package
 import argostranslate.translate
+import pandas
+import time
+from difflib import SequenceMatcher
 
 
 def load_arguments():
@@ -33,12 +36,17 @@ def load_arguments():
     arguments = {
         "id": None,
         "task": None,
+        "to": None,
         "translator": None,
+        "langs": [],
         "lang_from": None,
         "lang_to": None,
+        "key_match": None,
         "key": None,
+        "keys": [],
         "keys_from": [],
         "keys_to": [],
+        "ignore": [],
         "source": None,
         "sources": [],
         "destination": None,
@@ -51,16 +59,26 @@ def load_arguments():
             arguments["task"] = arg[6:]
         elif "-translator:" in arg:
             arguments["translator"] = arg[12:]
+        elif "-to:" in arg:
+            arguments["to"] = arg[4:]
+        elif "-langs:" in arg:
+            arguments["langs"] += arg[7:].split(",")
         elif "-lang_from:" in arg:
             arguments["lang_from"] = arg[11:]
         elif "-lang_to:" in arg:
             arguments["lang_to"] = arg[9:]
+        elif "-key_match:" in arg:
+            arguments["key_match"] = arg[11:]
         elif "-key:" in arg:
             arguments["key"] = arg[5:]
+        elif "-keys:" in arg:
+            arguments["keys"] += arg[6:].split(",")
         elif "-keys_from:" in arg:
             arguments["keys_from"] += arg[11:].split(",")
         elif "-keys_to:" in arg:
             arguments["keys_to"] += arg[9:].split(",")
+        elif "-ignore:" in arg:
+            arguments["ignore"] += arg[8:].split(",")
         elif "-source:" in arg:
             arguments["source"] = arg[8:]
         elif "-sources:" in arg:
@@ -81,7 +99,7 @@ def get_parent(filepath, level=1):
     Returns:
         string: The requested filepath
     '''
-    if level < 1:
+    if level <= 1:
         return os.path.dirname(filepath)
     return get_parent(os.path.dirname(filepath), level - 1)
 
@@ -93,7 +111,7 @@ def find_in_parents(file):
         file: The filename we are looking for
 
     Returns:
-        config: The parsed configuration
+        abspath: The absolute path found
     '''
     if not os.path.exists(file):
         for x in range(3):
@@ -138,12 +156,10 @@ def init_argos(from_code, to_code):
                available_packages))[0]
     download_path = available_package.download()
     argostranslate.package.install_from_path(download_path)
-    # installed_languages = argostranslate.translate.get_installed_languages()
-    # from_lang = list(
-    #     filter(lambda x: x.code == from_code, installed_languages))[0]
-    # to_lang = list(filter(lambda x: x.code == to_code, installed_languages))[0]
-    from_lang = argostranslate.translate.get_language_from_code(from_code)
-    to_lang = argostranslate.translate.get_language_from_code(to_code)
+    installed_languages = argostranslate.translate.get_installed_languages()
+    from_lang = list(
+        filter(lambda x: x.code == from_code, installed_languages))[0]
+    to_lang = list(filter(lambda x: x.code == to_code, installed_languages))[0]
     return from_lang.get_translation(to_lang)
 
 
@@ -159,7 +175,8 @@ def diclist_to_csv(diclist, destination, encoding='utf-8'):
     '''
     try:
         keys = diclist[0].keys()
-        with open(destination, 'w', newline="", encoding=encoding) as output_file:
+        with open(
+                destination, 'w', newline="", encoding=encoding) as output_file:
             dict_writer = csv.DictWriter(output_file, keys)
             dict_writer.writeheader()
             dict_writer.writerows(diclist)
@@ -288,6 +305,188 @@ def translate_csv(source=None,
     return True
 
 
+def translate_azure(text, lang_from='en', lang_to='fr', config=load_config()):
+    if 'azure' not in config:
+        return False
+    endpoint = config['azure']['endpoint']
+    constructed_url = f"{endpoint}/translate?api-version=3.0&from={lang_from}&to={lang_to}"
+
+    headers = {
+        'Ocp-Apim-Subscription-Key': config['azure']['subscription'],
+        'Ocp-Apim-Subscription-Region': config['azure']['region'],
+        'Content-type': 'application/json',
+        'X-ClientTraceId': str(uuid.uuid4())
+    }
+    body = [{'text': text}]
+    try:
+        request = requests.post(constructed_url, headers=headers, json=body)
+        response = request.json()
+        if "error" in response:
+            print("Error with Azure api:")
+            print(f"Code: {response['error']['code']}")
+            print(f"Message: {response['error']['message']}")
+            exit()
+        return response[0]['translations'][0]['text']
+    except requests.exceptions.ConnectionError:
+        print("ConnectionError: waiting 5 seconds and trying again.")
+        time.sleep(5)
+        return translate_azure(text, lang_from, lang_to, config)
+
+
+def translate(text,
+              lang_from='en',
+              lang_to='fr',
+              translator="argos",
+              engine=None):
+    if translator == 'azure':
+        return translate_azure(text, lang_from, lang_to)
+    else:
+        if not engine:
+            engine = init_argos(lang_from, lang_to)
+        return engine.translate(text)
+
+
+def loopfind(needle, haystack, key_match, ignore):
+    for i in range(len(haystack)):
+        if (haystack[i] == needle):
+            return i, 1
+    high_p = 0
+    high_i = 0
+    for i in range(len(haystack)):
+        ifval = True
+        for k, v in needle.items():
+            if k != key_match and k not in ignore:
+                ifval = ifval and haystack[i][k] == v
+                if not ifval:
+                    break
+        if not ifval:
+            continue
+        p = SequenceMatcher(None, haystack[i][key_match],
+                            needle[key_match]).ratio()
+        if p > high_p:
+            high_p = p
+            high_i = i
+        if " " in needle[key_match]:
+            reverse_string = " ".join(list(reversed(needle[key_match].split())))
+            p = SequenceMatcher(None, haystack[i][key_match],
+                                reverse_string).ratio()
+            if p > high_p:
+                high_p = p
+                high_i = i
+
+    if high_p != 0:
+        return high_i, high_p
+    return False, False
+
+
+def combine_csvs_translate(csva,
+                           csvb,
+                           keya,
+                           keyb,
+                           langa="en",
+                           langb="fr",
+                           ignore=[]):
+    if not csva or not csva:
+        return False
+    ignore.append(keyb)
+    # elemclasses = get_eleclasses()
+    encoding = 'utf-8'
+    combined_csv = []
+
+    if os.path.isfile(csva):
+        encoding = get_encoding_type(csva).lower()
+        combined_csv = list(csv.DictReader(open(csva, encoding=encoding)))
+
+    if os.path.isfile(csvb):
+        argos = init_argos(langb, langa)
+        encoding = get_encoding_type(csvb).lower()
+        csv_items = list(csv.DictReader(open(csvb, encoding=encoding)))
+        all_keys, common_keys = get_diclists_keys([combined_csv, csv_items])
+        for i in range(len(combined_csv)):
+            combined_csv[i] = {k: None for k in all_keys} | combined_csv[i]
+        # count = 1
+        for line in csv_items:
+            # print(f"line: ")
+            # print(line)
+            best_matches = {}
+            needle = {k: None for k in all_keys}
+            for k, v in line.items():
+                if v:
+                    needle[k] = v
+            translator = "argos"
+            needle[keya] = translate(line[keyb], langb, langa, translator,
+                                     argos)
+            found = False
+
+            i, p = loopfind(needle, combined_csv, keya, ignore)
+            if isinstance(i, (int, float)) and p == 1:
+                found = True
+                # combined_csv[i]['type_french'] = line['type_french']
+                combined_csv[i][keyb] = line[keyb]
+            elif isinstance(i, (int, float)) and p:
+                best_matches[translator] = {"i": i, "p": p, keya: needle[keya]}
+
+            if not found:
+                translator = "azure"
+                needle[keya] = translate(line[keyb], langb, langa, translator)
+                i, p = loopfind(needle, combined_csv, keya, ignore)
+                if isinstance(i, (int, float)) and p == 1:
+                    found = True
+                    # combined_csv[i]['type_french'] = line['type_french']
+                    combined_csv[i][keyb] = line[keyb]
+                elif isinstance(i, (int, float)) and p:
+                    best_matches[translator] = {
+                        "i": i,
+                        "p": p,
+                        keya: needle[keya]
+                    }
+
+            if not found and len(best_matches) > 0:
+                found = True
+                high_p = 0
+                high_i = 0
+                high_translator = None
+                for translator, namedata in best_matches.items():
+                    if namedata["p"] > high_p:
+                        high_p = namedata["p"]
+                        high_i = namedata["i"]
+                        high_translator = translator
+                # combined_csv[high_i]['type_french'] = line['type_french']
+                combined_csv[high_i][keyb] = line[keyb]
+
+            if not found:
+                combined_csv.append(needle)
+            # print(f"needle: ")
+            # print(needle)
+            # print(f"combined_csv[i]: ")
+            # print(combined_csv[i])
+            # print(f"best_matches: ")
+            # print(best_matches)
+            # print(f"i: {i}")
+            # print(f"p: {p}")
+            # exit()
+
+            # if count > 100:
+            #     print(json.dumps(combined_csv, indent=4))
+            #     exit()
+            # count += 1
+    # print(combined_csv)
+    # print(json.dumps(combined_csv, indent=4))
+    # exit()
+
+    for i in range(len(combined_csv)):
+        # if not combined_csv[i]["type_french"]:
+        #     for k, v in elemclasses.items():
+        #         if v == combined_csv[i]["type_english"]:
+        #             combined_csv[i]["type_french"] = k
+
+        if not combined_csv[i][keyb]:
+            combined_csv[i][keyb] = translate(
+                combined_csv[i][keya], translator="azure")
+
+    return combined_csv, encoding
+
+
 def combine_csvs_lfl(sources, destination):
     '''Combine two csv files line for line and returns a list of dictionaries.
 
@@ -385,6 +584,7 @@ def combine_csvs_commons(sources, destination):
                 diclist = fuse_diclists(diclist, csv_items)
     return diclist, encoding
 
+
 def fuse_diclists(diclist1, diclist2):
     if len(diclist1) < 1 or len(diclist2) < 1:
         return False
@@ -393,19 +593,21 @@ def fuse_diclists(diclist1, diclist2):
     diclist = []
     for dic1 in diclist1:
         toremove = []
-        resdic = {k:None for k in all_keys}|dic1
+        resdic = {k: None for k in all_keys} | dic1
         for i in range(len(diclist2)):
             for ck in common_keys:
-                if resdic[ck] and ck in diclist2[i] and resdic[ck] == diclist2[i][ck]:
+                if resdic[ck] and ck in diclist2[i] and resdic[ck] == diclist2[
+                        i][ck]:
                     toremove.append(i)
-                    diclist.append(copy.deepcopy(resdic)|diclist2[i])
-            
+                    diclist.append(copy.deepcopy(resdic) | diclist2[i])
+
         for i in sorted(toremove, reverse=True):
             del diclist2[i]
     for dic2 in diclist2:
-        diclist.append({k:None for k in all_keys}|dic2)
-    
+        diclist.append({k: None for k in all_keys} | dic2)
+
     return diclist
+
 
 def get_diclists_keys(diclists):
     '''Combine two csv and returns a list of dictionaries.
@@ -436,12 +638,11 @@ def compare_columns(source=None, keys_from={}, keys_to={}):
     return False
 
 
-
 def combine_csvs(sources, destination, id=None):
     '''Combine two csv and returns a list of dictionaries.
 
     Args:
-        sources     : A list of filepaths for the source csv files
+        sources     : A list or dictionary of filepaths for the source csv files
         destination : The filepath for the destination csv file
         id          : The keyname for the common column if there is one
 
@@ -453,13 +654,25 @@ def combine_csvs(sources, destination, id=None):
     if not destination:
         return False
 
+    arguments = load_arguments()
     encoding = 'utf-8'
     combined_csv = None
-    if not id:
+
+    if len(arguments['keys']) > 1 and len(arguments['langs']) > 1:
+        combined_csv, encoding = combine_csvs_translate(
+            csva=sources[0],
+            csvb=sources[1],
+            keya=arguments['keys'][0],
+            keyb=arguments['keys'][1],
+            langa=arguments['langs'][0],
+            langb=arguments['langs'][1],
+            ignore=arguments['ignore'])
+    elif not id:
         diclists = []
         for source in sources:
             encoding = get_encoding_type(source).lower()
-            diclists.append(list(csv.DictReader(open(source, encoding=encoding))))
+            diclists.append(
+                list(csv.DictReader(open(source, encoding=encoding))))
         all_keys, common_keys = get_diclists_keys(diclists)
         if len(common_keys) > 0:
             combined_csv, encoding = combine_csvs_commons(sources, destination)
@@ -554,7 +767,8 @@ def extract_columns(source, destination, keys_from=None, keys_to=None):
         nd = {}
         for i in range(len(keys_from)):
             nd[keys_to[i]] = d[keys_from[i]].strip()
-        diclist.append(nd)
+        if nd not in diclist:
+            diclist.append(nd)
 
     diclist_to_csv(diclist, destination, encoding)
 
@@ -643,6 +857,53 @@ def move_all_files(source, destination):
         if os.path.isfile(file_from):
             shutil.move(file_from, file_to)
             print('Moved:', file_name)
+
+
+def findfreename(filepath, attempt=0):
+    ''' Given a filepath it will try to find a free filename by appending to the name.
+    First trying as passed in argument, then adding [HEVC] to the end and if all fail [HEVC](#).
+
+    Args:
+        filepath    :   A string containing the full filepath
+        attempt     :   The number of times we have already tryed
+    Returns:
+        filepath    :   The first free filepath we found
+    '''
+    attempt += 1
+    filename = str(filepath)[:str(filepath).rindex(".")]
+    extension = str(filepath)[str(filepath).rindex("."):]
+    copynumpath = filename + f"({attempt})" + extension
+
+    if not os.path.exists(filepath) and attempt <= 2:
+        return filepath
+    elif not os.path.exists(copynumpath):
+        return copynumpath
+    return findfreename(filepath, attempt)
+
+
+def convert(sources, destination=None, to=None):
+    '''
+
+    Args:
+        source      : The source filepath
+        destination : The destination filepath
+
+    Returns:
+    '''
+    if not to:
+        to = "csv"
+    for source in sources:
+        if not os.path.isfile(source):
+            continue
+        filename, file_extension = os.path.splitext(source)
+        file_extension = file_extension.replace(".", "")
+        if not destination:
+            destination = f"{filename}.{to}"
+            destination = findfreename(destination)
+
+        if file_extension in ["xls", "xlsx"] and to == "csv":
+            df = pandas.DataFrame(pandas.read_excel(source))
+            df.to_csv(destination, index=None, header=True)
 
 
 def test01(source=None, destination=None):
